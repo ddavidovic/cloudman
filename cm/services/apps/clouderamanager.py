@@ -7,14 +7,14 @@ import socket
 
 from ansible.runner import Runner
 from ansible.inventory import Inventory
-from cm_api.api_client import ApiResource  # Cloudera Manager API
+from cm_api.api_client import ApiResource
 from cm_api.api_client import ApiException
 # from cm_api.endpoints.clusters import ApiCluster
-# from cm_api.endpoints.clusters import create_cluster
+from cm_api.endpoints.clusters import create_cluster
 # from cm_api.endpoints.parcels import ApiParcel
 from cm_api.endpoints.parcels import get_parcel
-# from cm_api.endpoints.cms import ClouderaManager
-from cm_api.endpoints.services import ApiServiceSetupInfo
+from cm_api.endpoints.cms import ClouderaManager
+from cm_api.endpoints.services import ApiService, ApiServiceSetupInfo
 # from cm_api.endpoints.services import ApiService, create_service
 # from cm_api.endpoints.types import ApiCommand, ApiRoleConfigGroupRef
 # from cm_api.endpoints.role_config_groups import get_role_config_group
@@ -24,11 +24,14 @@ from time import sleep
 
 from cm.util import misc
 import cm.util.paths as paths
-from cm.services import ServiceRole
-from cm.services import service_states
+# from cm.services import ServiceRole
+# from cm.services import service_states
 from cm.services.apps import ApplicationService
+from cm.services import (Service, ServiceDependency, ServiceRole, ServiceType,
+                         service_states)
 
 import logging
+import urllib2
 log = logging.getLogger('cloudman')
 
 NUM_START_ATTEMPTS = 2  # Number of times we attempt to auto-restart the service
@@ -51,7 +54,17 @@ class ClouderaManagerService(ApplicationService):
         # TODO - read local cloud host name!
         # self.cm_host = socket.gethostname()
         self.cm_host = self.app.cloud_interface.get_local_hostname()
-        self.host_list = []
+        # The actual worker nodes (note: this is a list of Instance objects)
+        # (because get_worker_instances currently depends on tags, which is only
+        # supported by EC2, get the list of instances only for the case of EC2 cloud.
+        # This initialization is applicable only when restarting a cluster.
+        # self.host_list = get_worker_instances() if (
+        #    self.app.cloud_type == 'ec2' or self.app.cloud_type == 'openstack') else []
+        # self.host_list = ["w1", "w2"]
+        # self.instances = self.app.manager.worker_instances
+        # self.host_list = [l.get_local_hostname() for l in self.app.manager.worker_instances]
+        # self.host_list = [l.get_private_ip for l in self.app.manager.worker_instances]
+        self.host_list = None
         self.cluster_name = "Cluster 1"
         self.cdh_version = "CDH5"
         self.cdh_version_number = "5"
@@ -61,6 +74,16 @@ class ClouderaManagerService(ApplicationService):
         self.host_username = "ubuntu"
         self.host_password = self.app.config.get('password')
         self.cm_repo_url = None
+        self.hdfs_service_name = "HDFS"
+        self.hadoop_data_dir_prefix = "/mnt/dfs"
+        self.yarn_service_name = "YARN"
+        self.parcel_version = "5.4.1"
+        self.cmd_timeout = 180
+        self.api = None
+        self.manager = None
+        self.cluster = None
+        self.hdfs_service = None
+        self.yarn_service = None
         self.service_types_and_names = {
             "HDFS": "HDFS",
             "YARN": "YARN"
@@ -113,7 +136,7 @@ class ClouderaManagerService(ApplicationService):
             self.configure_db()
             self.start_webserver()
             self.set_default_user()
-            # self.create_cluster()
+            self.create_cluster()
             # self.setup_cluster()
             self.remaining_start_attempts -= 1
         except Exception, exc:
@@ -250,6 +273,7 @@ class ClouderaManagerService(ApplicationService):
         Replace the default 'admin' user with a default system one (generally
         ``ubuntu``) and it's password.
         """
+        log.info("Setting up default user.")
         host_username_exists = default_username_exists = False
         existing_users = self.cm_api_resource.get_all_users().to_json_dict().get('items', [])
         for existing_user in existing_users:
@@ -271,79 +295,131 @@ class ClouderaManagerService(ApplicationService):
             log.debug("Deleting the old default user 'admin'...")
             self.cm_api_resource.delete_user(old_admin)
 
-    def init_cluster(api, self):
+    # def init_cluster(api, clusterName, cdhVersion, self):
+    def init_cluster(self):
         """
-        Create a new cluster and add hosts to it.
+        Create cluster and add hosts.
         """
 
-        cluster = api.create_cluster(self.cluster_name, self.cdh_version_number)
+        log.info("Retrieving the list of hosts...")
         # Add the CM host to the list of hosts to add in the cluster so it can run the management services
-        all_hosts = list(self.host_list)
-        all_hosts.append(self.cm_host)
-        cluster.add_hosts(all_hosts)
-        return cluster
+        self.host_list = []
+        for host in self.app.manager.worker_instances:
+            host_ip = host.get_private_ip()
+            host_name = host.get_local_hostname()
+            self.host_list.append(host_ip)
+            log.info("Host: {0}".format(host_name))
 
-    def deploy_management(manager, self):
+        # install hosts on this CM instance
+        cmd = self.manager.host_install(self.host_username, self.host_list,
+                                           password=self.host_password,
+                                           cm_repo_url=self.cm_repo_url)
+#                                           java_install_strategy=None)
+        log.debug("Installing hosts. This might take a while...")
+        while cmd.success is None:
+            sleep(5)
+            cmd = cmd.fetch()
+
+        if cmd.success is not True:
+            log.error("Adding hosts to Cloudera Manager failed: {0}".format(cmd.resultMessage))
+        log.debug("Host added to Cloudera Manager")
+
+        # first auto-assign roles and auto-configure the CM service
+        #self.manager.auto_assign_roles()
+        #self.manager.auto_configure()
+
+        log.info("Creating cluster {0}...".format(self.cluster_name))
+        self.cluster = self.api.create_cluster(self.cluster_name, version=self.cdh_version)
+
+        # log.info("Adding hosts to the cluster...")
+        # all_hosts = self.host_list
+        # all_hosts.append(self.cm_host)
+        # self.cluster.add_hosts(all_hosts)
+
+        log.info("Adding hosts to the cluster...")
+        all_hosts = []
+        for h in self.api.get_all_hosts():
+            all_hosts.append(h.hostname)
+            log.info("Host: {0}, {1}, {2}".format(h.hostId, h.hostname, h.ipAddress))
+        #all_hosts = self.host_list
+        #all_hosts.append(self.cm_host)
+        self.cluster.add_hosts(all_hosts)
+
+        # Update the list of worker hosts - use local hostname retrieved from ClouderaManager API instead of IP addresses
+        # remove master host
+        self.host_list = all_hosts
+        self.host_list.remove(self.cm_host)
+#        for h in self.host_list:
+#            log.info("Host name: {0}".format(h))
+
+        self.cluster = self.api.get_cluster(self.cluster_name)
+
+        # return cluster
+
+    # def deploy_management(manager, self):
+    def deploy_management(self):
         """
-        Create and deploy new management service
+        Create and deploy management services
         """
-        MGMT_SERVICE_CONFIG = {
+        mgmt_service_config = {
             'zookeeper_datadir_autocreate': 'true',
         }
-        MGMT_ROLE_CONFIG = {
+        mgmt_role_config = {
             'quorumPort': 2888,
         }
-        AMON_ROLENAME = "ACTIVITYMONITOR"
-        AMON_ROLE_CONFIG = {
+        amon_role_name = "ACTIVITYMONITOR"
+        amon_role_conf = {
             'firehose_database_host': self.cm_host + ":7432",
             'firehose_database_user': 'amon',
             'firehose_database_password': self.db_pwd,
             'firehose_database_type': 'postgresql',
             'firehose_database_name': 'amon',
-            'firehose_heapsize': '215964392',
+#            'firehose_heapsize': '215964392',
+            'firehose_heapsize': '268435456',
         }
-        APUB_ROLENAME = "ALERTPUBLISHER"
-        APUB_ROLE_CONFIG = {}
-        ESERV_ROLENAME = "EVENTSERVER"
-        ESERV_ROLE_CONFIG = {
+        apub_role_name = "ALERTPUBLISER"
+        apub_role_conf = {}
+        eserv_role_name = "EVENTSERVER"
+        eserv_role_conf = {
             'event_server_heapsize': '215964392'
         }
-        HMON_ROLENAME = "HOSTMONITOR"
-        HMON_ROLE_CONFIG = {}
-        SMON_ROLENAME = "SERVICEMONITOR"
-        SMON_ROLE_CONFIG = {}
-        NAV_ROLENAME = "NAVIGATOR"
-        NAV_ROLE_CONFIG = {
-            'navigator_database_host': self.cm_host + ":7432",
-            'navigator_database_user': 'nav',
-            'navigator_database_password': self.db_pwd,
-            'navigator_database_type': 'postgresql',
-            'navigator_database_name': 'nav',
-            'navigator_heapsize': '215964392',
-        }
-        NAVMS_ROLENAME = "NAVIGATORMETADATASERVER"
-        NAVMS_ROLE_CONFIG = {}
-        RMAN_ROLENAME = "REPORTMANAGER"
-        RMAN_ROLE_CONFIG = {
-            'headlamp_database_host': self.cm_host + ":7432",
-            'headlamp_database_user': 'rman',
-            'headlamp_database_password': self.db_pwd,
-            'headlamp_database_type': 'postgresql',
-            'headlamp_database_name': 'rman',
-            'headlamp_heapsize': '215964392',
-        }
+        hmon_role_name = "HOSTMONITOR"
+        hmon_role_conf = {}
+        smon_role_name = "SERVICEMONITOR"
+        smon_role_conf = {}
+        # nav_role_name = "NAVIGATOR"
+        # nav_role_conf = {
+        #    'navigator_database_host': self.cm_host + ":7432",
+        #    'navigator_database_user': 'nav',
+        #    'navigator_database_password': self.db_pwd,
+        #    'navigator_database_type': 'postgresql',
+        #    'navigator_database_name': 'nav',
+        #    'navigator_heapsize': '215964392',
+        # }
+        # navms_role_name = "NAVIGATORMETADATASERVER"
+        # navms_role_conf = {}
+        # rman_role_name = "REPORTMANAGER"
+        # rman_role_conf = {
+        #    'headlamp_database_host': self.cm_host + ":7432",
+        #    'headlamp_database_user': 'rman',
+        #    'headlamp_database_password': self.db_pwd,
+        #    'headlamp_database_type': 'postgresql',
+        #    'headlamp_database_name': 'rman',
+        #    'headlamp_heapsize': '215964392',
+        # }
 
-        mgmt = manager.create_mgmt_service(ApiServiceSetupInfo())
+        mgmt = self.manager.create_mgmt_service(ApiServiceSetupInfo())
 
-        # create roles. Note that host id may be different from host name (especially in CM 5). Look it it up in /api/v5/hosts
-        mgmt.create_role(amon_role_name + "-1", "ACTIVITYMONITOR", CM_HOST)
-        mgmt.create_role(apub_role_name + "-1", "ALERTPUBLISHER", CM_HOST)
-        mgmt.create_role(eserv_role_name + "-1", "EVENTSERVER", CM_HOST)
-        mgmt.create_role(hmon_role_name + "-1", "HOSTMONITOR", CM_HOST)
-        mgmt.create_role(smon_role_name + "-1", "SERVICEMONITOR", CM_HOST)
-        # mgmt.create_role(nav_role_name + "-1", "NAVIGATOR", CM_HOST)
-        # mgmt.create_role(navms_role_name + "-1", "NAVIGATORMETADATASERVER", CM_HOST)
-        # mgmt.create_role(rman_role_name + "-1", "REPORTSMANAGER", CM_HOST)
+        # create roles. Note that host id may be different from host name (especially in CM 5).
+        # Look it it up in /api/v5/hosts
+        mgmt.create_role(amon_role_name + "-1", "ACTIVITYMONITOR", self.cm_host)
+        mgmt.create_role(apub_role_name + "-1", "ALERTPUBLISHER", self.cm_host)
+        mgmt.create_role(eserv_role_name + "-1", "EVENTSERVER", self.cm_host)
+        mgmt.create_role(hmon_role_name + "-1", "HOSTMONITOR", self.cm_host)
+        mgmt.create_role(smon_role_name + "-1", "SERVICEMONITOR", self.cm_host)
+        # mgmt.create_role(nav_role_name + "-1", "NAVIGATOR", self.cm_host)
+        # mgmt.create_role(navms_role_name + "-1", "NAVIGATORMETADATASERVER", self.cm_host)
+        # mgmt.create_role(rman_role_name + "-1", "REPORTSMANAGER", self.cm_host)
 
         # now configure each role
         for group in mgmt.get_all_role_config_groups():
@@ -368,64 +444,14 @@ class ClouderaManagerService(ApplicationService):
         mgmt.start().wait()
         return mgmt
 
-    def create_cluster(self):
+    def deploy_parcels(self):
         """
-        Create a cluster and Cloudera Manager Service on master host
+        Downloads and distributes parcels
         """
-        log.info("Creating Cloudera cluster: '{0}'. Please wait...".format(self.cluster_name))
-
-        ### CM Definitions ###
-        CM_CONFIG = {
-            'TSQUERY_STREAMS_LIMIT' : 1000,
-        }
-
-        ### Create and deploy new cluster ##
-        ar = self.cm_api_resource
-        manager = self.cm_manager
-        manager.update_config(CM_CONFIG)
-        log.info("Connected to CM host on " + self.cm_host + " and updated CM configuration")
-
-        ## Initialize a cluster ##
-        cluster = self.init_cluster(ar)
-        log.info("Initialized cluster " + self.cluster_name + " which uses CDH version " + self.cdh_version_number)
-
-        ## Deploy management service ##
-        deploy_management(manager)
-        log.info("Deployed CM management service " + self.mgmt_service_name + " to run on " + self.cm_host)
-
-
-
-        # install hosts on this CM instance
-        cmd = self.cm_manager.host_install(self.host_username, self.host_list,
-                                           password=self.host_password,
-                                           cm_repo_url=self.cm_repo_url)
-        log.debug("Installing hosts. This might take a while...")
-        while cmd.success is None:
-            sleep(5)
-            cmd = cmd.fetch()
-
-        if cmd.success is not True:
-            log.error("Adding hosts to Cloudera Manager failed: {0}".format(cmd.resultMessage))
-
-        log.debug("Host added to Cloudera Manager")
-
-        # first auto-assign roles and auto-configure the CM service
-        self.cm_manager.auto_assign_roles()
-        self.cm_manager.auto_configure()
-
-        # create a cluster on that instance
-        cluster = self.cm_api_resource.create_cluster(self.cluster_name, self.cdh_version)
-        log.debug("Cloudera cluster: {0} created".format(self.cluster_name))
-
-        # add all hosts on the cluster
-        cluster.add_hosts(self.host_list)
-
-        cluster = self.cm_api_resource.get_cluster(self.cluster_name)
 
         # get and list all available parcels
         parcels_list = []
-        log.debug("Installing parcels...")
-        for p in cluster.get_all_parcels():
+        for p in self.cluster.get_all_parcels():
             print '\t' + p.product + ' ' + p.version
             if p.version.startswith(self.cdh_version_number) and p.product == "CDH":
                 parcels_list.append(p)
@@ -475,6 +501,330 @@ class ClouderaManagerService(ApplicationService):
             cdh_parcel = get_parcel(self.cm_api_resource, cdh_parcel.product, cdh_parcel.version, self.cluster_name)
 
         log.debug("Parcel: {0} {1} activated".format(cdh_parcel.product, cdh_parcel.version))
+        # Get list of parcels from the cloudera repo to see what the latest version is. Then to parse:
+        # find first item that starts with CDH-
+        # strip off leading CDH-
+        # strip off everything after the last - in that item, including the -
+        # latest_parcel_url = 'http://archive.cloudera.com/cdh5/parcels/' + self.parcel_version + '/'
+        # parcel_prefix = 'CDH-'
+        # dir_list = urllib2.urlopen(latest_parcel_url).read()
+        # dir_list = dir_list[dir_list.index(parcel_prefix)+len(parcel_prefix):]
+        # dir_list = dir_list[:dir_list.index('"')]
+        # self.parcel_version = dir_list[:dir_list.rfind('-')]
+        # self.parcel_version = "5.4.1"
+        # parcels = [
+        #     {'name': "CDH", 'version': self.parcel_version},
+        #     # { 'name' : "CDH", 'version' : "5.0.1-1.cdh5.0.1.p0.47" },
+        #     # { 'name' : "ACCUMULO", 'version' : "1.4.3-cdh4.3.0-beta-3"}
+        # ]
+
+        # for parcel in parcels:
+        #     p = self.cluster.get_parcel(parcel['name'], parcel['version'])
+        #     p.start_download()
+        #     while True:
+        #         p = self.cluster.get_parcel(parcel['name'], parcel['version'])
+        #         if p.stage == "DOWNLOADED":
+        #             break
+        #         if p.state.errors:
+        #             raise Exception(str(p.state.errors))
+        #         log.info("Downloading %s: %s / %s" % (parcel['name'], p.state.progress, p.state.totalProgress))
+        #         sleep(5)
+        #     log.info("Downloaded %s" % (parcel['name']))
+        #     p.start_distribution()
+        #     while True:
+        #         p = self.cluster.get_parcel(parcel['name'], parcel['version'])
+        #         if p.stage == "DISTRIBUTED":
+        #             break
+        #         if p.state.errors:
+        #             raise Exception(str(p.state.errors))
+        #         print "Distributing %s: %s / %s" % (parcel['name'], p.state.progress, p.state.totalProgress)
+        #         sleep(15)
+        #     log.info("Parcel: %s" % (parcel['name']))
+        #     p.activate()
+
+    def deploy_hdfs(self):
+        """
+        Deploys HDFS - NN, DNs, SNN, gateways.
+        """
+
+        ### HDFS Configuration ###
+        dfs_rep = None
+        if len(self.host_list) > 2:
+            dfs_rep = 3
+        else:
+            dfs_rep = len(self.host_list)
+
+        hdfs_config = {
+            'dfs_replication': dfs_rep,
+            'dfs_permissions': 'false',
+            # 'dfs_block_local_path_access_user': 'impala,hbase,mapred,spark',
+            'dfs_block_local_path_access_user': 'mapred,spark',
+        }
+        hdfs_nn_service_name = "nn"
+        hdfs_nn_host = self.cm_host
+        hdfs_nn_config = {
+            # 'dfs_name_dir_list': '/data01/hadoop/namenode',
+            'dfs_name_dir_list': self.hadoop_data_dir_prefix + '/nn',  # '/namenode',
+            'dfs_namenode_handler_count': 30,
+        }
+        hdfs_snn_host = self.host_list[1]
+        hdfs_snn_config = {
+            # 'fs_checkpoint_dir_list': '/data01/hadoop/namesecondary',
+            'fs_checkpoint_dir_list': self.hadoop_data_dir_prefix + '/snn',  # '/namesecondary',
+        }
+        hdfs_dn_hosts = self.host_list
+        # hdfs_dn_hosts = [l.hostId for l in self.host_list
+        # dfs_datanode_du_reserved must be smaller than the amount of free space across the data dirs
+        # Ideally each data directory will have at least 1TB capacity; they need at least 100GB at a minimum
+        # dfs_datanode_failed_volumes_tolerated must be less than the number of different data dirs (ie volumes) in
+        # dfs_data_dir_list
+        hdfs_dn_config = {
+            'dfs_data_dir_list': self.hadoop_data_dir_prefix + '/dn',  # '/datanode',
+            'dfs_datanode_handler_count': 30,
+            # 'dfs_datanode_du_reserved': 42949672960,
+            'dfs_datanode_du_reserved': 1073741824,
+            'dfs_datanode_failed_volumes_tolerated': 0,
+            'dfs_datanode_data_dir_perm': 755,
+        }
+        hdfs_gw_hosts = self.host_list
+        # hdfs_gw_hosts = [l.hostId for l in self.host_list]
+        hdfs_gw_hosts.append(self.cm_host)
+        hdfs_gw_config = {
+            'dfs_client_use_trash': 'true'
+        }
+
+        self.hdfs_service = self.cluster.create_service(self.hdfs_service_name, "HDFS")
+        self.hdfs_service.update_config(hdfs_config)
+
+        nn_role_group = self.hdfs_service.get_role_config_group("{0}-NAMENODE-BASE".format(self.hdfs_service_name))
+        nn_role_group.update_config(hdfs_nn_config)
+        nn_service_pattern = "{0}-" + hdfs_nn_service_name
+        self.hdfs_service.create_role(nn_service_pattern.format(self.hdfs_service_name), "NAMENODE", hdfs_nn_host)
+
+        snn_role_group = self.hdfs_service.get_role_config_group("{0}-SECONDARYNAMENODE-BASE".format(self.hdfs_service_name))
+        snn_role_group.update_config(hdfs_snn_config)
+        self.hdfs_service.create_role("{0}-snn".format(self.hdfs_service_name), "SECONDARYNAMENODE", hdfs_snn_host)
+
+        dn_role_group = self.hdfs_service.get_role_config_group("{0}-DATANODE-BASE".format(self.hdfs_service_name))
+        dn_role_group.update_config(hdfs_dn_config)
+
+        gw_role_group = self.hdfs_service.get_role_config_group("{0}-GATEWAY-BASE".format(self.hdfs_service_name))
+        gw_role_group.update_config(hdfs_gw_config)
+
+        datanode = 0
+        for host in hdfs_dn_hosts:
+            datanode += 1
+            self.hdfs_service.create_role("{0}-dn-".format(self.hdfs_service_name) + str(datanode), "DATANODE", host)
+
+        gateway = 0
+        for host in hdfs_gw_hosts:
+            gateway += 1
+            self.hdfs_service.create_role("{0}-gw-".format(self.hdfs_service_name) + str(gateway), "GATEWAY", host)
+
+        # return hdfs_service
+
+    def init_hdfs(self):
+        """
+        Initializes HDFS - format the file system
+        """
+        hdfs = self.cluster.get_service(self.hdfs_service_name)
+#        cmd = self.hdfs_service.format_hdfs("{0}-nn".format(self.hdfs_service_name))[0]
+        cmd = hdfs.format_hdfs("{0}-nn".format(self.hdfs_service_name))[0]
+        if not cmd.wait(self.cmd_timeout).success:
+            log.info("WARNING: Failed to format HDFS, attempting to continue with the setup")
+
+    def deploy_yarn(self):
+        """
+        Deploys YARN - RM, JobHistoryServer, NMs, gateways
+        """
+
+        ### YARN Configuration ###
+        yarn_service_config = {
+            'hdfs_service': self.hdfs_service_name,
+        }
+        yarn_rm_host = self.cm_host
+        yarn_rm_config = {}
+        yarn_jhs_host = self.cm_host
+        yarn_jhs_config = {}
+        yarn_nm_hosts = self.host_list
+        # yarn_nm_hosts = [l.hostId for l in self.host_list]
+        yarn_nm_config = {
+            # 'yarn_nodemanager_local_dirs': '/data01/hadoop/yarn/nm',
+            'yarn_nodemanager_local_dirs': self.hadoop_data_dir_prefix + '/yarn/nm',
+        }
+        yarn_gw_hosts = self.host_list
+        # yarn_gw_hosts = [l.hostId for l in self.host_list]
+        yarn_gw_config = {
+            'mapred_submit_replication': min(3, len(yarn_gw_hosts))
+        }
+
+        self.yarn_service = self.cluster.create_service(self.yarn_service_name, "YARN")
+        self.yarn_service.update_config(yarn_service_config)
+
+        rm = self.yarn_service.get_role_config_group("{0}-RESOURCEMANAGER-BASE".format(self.yarn_service_name))
+        rm.update_config(yarn_rm_config)
+        self.yarn_service.create_role("{0}-rm".format(self.yarn_service_name), "RESOURCEMANAGER", yarn_rm_host)
+
+        jhs = self.yarn_service.get_role_config_group("{0}-JOBHISTORY-BASE".format(self.yarn_service_name))
+        jhs.update_config(yarn_jhs_config)
+        self.yarn_service.create_role("{0}-jhs".format(self.yarn_service_name), "JOBHISTORY", yarn_jhs_host)
+
+        nm = self.yarn_service.get_role_config_group("{0}-NODEMANAGER-BASE".format(self.yarn_service_name))
+        nm.update_config(yarn_nm_config)
+
+        nodemanager = 0
+        for host in yarn_nm_hosts:
+            nodemanager += 1
+            self.yarn_service.create_role("{0}-nm-".format(self.yarn_service_name) + str(nodemanager), "NODEMANAGER", host)
+
+        gw = self.yarn_service.get_role_config_group("{0}-GATEWAY-BASE".format(self.yarn_service_name))
+        gw.update_config(yarn_gw_config)
+
+        gateway = 0
+        for host in yarn_gw_hosts:
+            gateway += 1
+            self.yarn_service.create_role("{0}-gw-".format(self.yarn_service_name) + str(gateway), "GATEWAY", host)
+
+        # return yarn_service
+
+    def post_startup(self):
+        """
+        Executes steps that need to be done after the final startup once everything is deployed and running.
+        """
+        # Create HDFS temp dir
+        self.hdfs_service.create_hdfs_tmp()
+
+        # Create hive warehouse dir
+        # shell_command = ['curl -i -H "Content-Type: application/json" -X POST -u "' + ADMIN_USER + ':' + ADMIN_PASS + '" -d "serviceName=' + HIVE_SERVICE_NAME + ';clusterName=' + CLUSTER_NAME + '" http://' + CM_HOST + ':7180/api/v5/clusters/' + CLUSTER_NAME + '/services/' + HIVE_SERVICE_NAME + '/commands/hiveCreateHiveWarehouse']
+        # create_hive_warehouse_output = Popen(shell_command, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT, close_fds=True).stdout.read()
+
+        # Create oozie database
+        # oozie_service.stop().wait()
+        # shell_command = ['curl -i -H "Content-Type: application/json" -X POST -u "' + ADMIN_USER + ':' + ADMIN_PASS + '" -d "serviceName=' + OOZIE_SERVICE_NAME + ';clusterName=' + CLUSTER_NAME + '" http://' + CM_HOST + ':7180/api/v5/clusters/' + CLUSTER_NAME + '/services/' + OOZIE_SERVICE_NAME + '/commands/createOozieDb']
+        # create_oozie_db_output = Popen(shell_command, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT, close_fds=True).stdout.read()
+
+        # give the create db command time to complete
+        sleep(30)
+        # oozie_service.start().wait()
+
+        # Deploy client configs to all necessary hosts
+        cmd = self.cluster.deploy_client_config()
+        if not cmd.wait(self.cmd_timeout).success:
+            log.info("Failed to deploy client configs for {0}".format(self.cluster_name))
+
+        # Now change permissions on the /user dir so YARN will work
+        shell_command = ['sudo -u hdfs hadoop fs -chmod 775 /user']
+        misc.run(shell_command)
+        # user_chmod_output = Popen(shell_command, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT, close_fds=True).stdout.read()
+
+    def create_cluster(self):
+        """
+        Create a cluster and Cloudera Manager Service on master host
+        """
+        log.info("Creating Cloudera cluster: '{0}'. Please wait...".format(self.cluster_name))
+
+        ### CM Definitions ###
+        CM_CONFIG = {
+            'TSQUERY_STREAMS_LIMIT': 1000,
+        }
+
+        ### Create and deploy new cluster ##
+        log.info("Creating and deplying new cluster...")
+        self.api = self.cm_api_resource
+        #self.api = ApiResource(self.cm_host, self.cm_port, self.cm_username, self.cm_password, version=11)
+        #self.manager = self.cm_manager
+        #self.manager = ClouderaManager(self.api)
+        self.manager = self.api.get_cloudera_manager()
+        #self.manager.update_config(CM_CONFIG)
+        #log.info("Connected to CM host on " + self.cm_host + " and updated CM configuration")
+
+        ### Create the management service
+        #service_setup = ApiServiceSetupInfo(name=self.service_types_and_names, type="MGMT")
+        #elf.manager.create_mgmt_service(service_setup)
+
+        ## Initialize a cluster ##
+        log.info("Initializing the cluster...")
+        self.init_cluster()
+        # log.info("Creating cluster....")
+        # self.cluster = self.api.create_cluster(self.cluster_name, self.cdh_version)
+        # Add the CM host to the list of hosts to add in the cluster so it can run the management services
+        # log.info("Adding hosts to the cluster...")
+        # hosts = self.host_list
+        # log.info("self.host list " + self.host_list)
+        # self.host_list = [l.get_local_hostname() for l in self.app.manager.worker_instances]
+
+        # all_hosts = list(self.host_list)
+        # all_hosts.append(self.cm_host)
+        # self.cluster.add_hosts(all_hosts)
+
+        log.info("Cloudera cluster: {0} initialized".format(self.cluster_name) + " which uses CDH version " + self.cdh_version_number)
+
+       ## Deploy management service ##
+        log.info("Deploying management service...")
+        self.deploy_management()
+        log.info("Deployed CM management service " + self.mgmt_service_name + " to run on " + self.cm_host)
+
+        ## Downloading, distribute and active parcels ##
+        log.info("Installing parcels...")
+        self.deploy_parcels()
+        log.info("Parcels are downloaded and distributed.")
+
+        # Deploying hadoop services ##
+        log.info("Deploying hdfs...")
+        self.hdfs_service = self.deploy_hdfs()
+        log.info("Deployed HDFS service " + self.hdfs_service_name)
+        self.init_hdfs()
+        log.info("Initialized HDFS service")
+
+        log.info("Deploying yarn...")
+        self.yarn_service = self.deploy_yarn()
+        log.info("Deployed YARN service " + self.yarn_service_name)
+
+        log.info("About to restart cluster.")
+        self.cluster.stop().wait()
+        self.cluster.start().wait()
+        log.info("Done restarting cluster.")
+
+        #log.info("Post startup...")
+        #self.post_startup()
+
+        # download the parcel
+        # log.debug("Starting parcel downloading...")
+        # cmd = cdh_parcel.start_download()
+        # if cmd.success is not True:
+        #    log.error("Parcel download failed!")
+
+        # make sure the download finishes
+        # while cdh_parcel.stage != 'DOWNLOADED':
+        #    sleep(5)
+        #    cdh_parcel = get_parcel(self.cm_api_resource, cdh_parcel.product, cdh_parcel.version, self.cluster_name)
+
+        # log.debug("Parcel: {0} {1} downloaded".format(cdh_parcel.product, cdh_parcel.version))
+
+        # distribute the parcel
+        # log.debug("Distributing parcels...")
+        # cmd = cdh_parcel.start_distribution()
+        # if cmd.success is not True:
+        #    log.error("Parcel distribution failed!")
+
+        # make sure the distribution finishes
+        # while cdh_parcel.stage != "DISTRIBUTED":
+        #    sleep(5)
+        #    cdh_parcel = get_parcel(self.cm_api_resource, cdh_parcel.product, cdh_parcel.version, self.cluster_name)
+
+        # log.debug("Parcel: {0} {1} distributed".format(cdh_parcel.product, cdh_parcel.version))
+
+        # activate the parcel
+        # log.debug("Activating parcels...")
+        # cmd = cdh_parcel.activate()
+        # if cmd.success is not True:
+        #    log.error("Parcel activation failed!")
+
+        # make sure the activation finishes
+        # while cdh_parcel.stage != "ACTIVATED":
+        #    cdh_parcel = get_parcel(self.cm_api_resource, cdh_parcel.product, cdh_parcel.version, self.cluster_name)
+
+        # log.debug("Parcel: {0} {1} activated".format(cdh_parcel.product, cdh_parcel.version))
 
         # inspect hosts and print the result
         log.debug("Inspecting hosts. This might take a few minutes")
