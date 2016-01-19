@@ -427,15 +427,6 @@ class ConsoleManager(BaseConsoleManager):
                 wi.reboot(count_reboot=False)
         self.manager_started = True
 
-       # Add master's private IP to /etc/hosts (workers need it and
-        # master's /etc/hosts is being synced to the workers)
-        misc.add_to_etc_hosts(self.app.cloud_interface.get_private_ip(),
-                              [self.app.cloud_interface.get_local_hostname(),
-                               misc.get_hostname(),
-                               'master'])
-        # Set the default hostname
-        misc.set_hostname(self.app.cloud_interface.get_local_hostname())
-
         # Check if a previously existing cluster is being recreated or if it is a new one
         if not self.initial_cluster_type:  # this can get set by _handle_old_cluster_conf_format
             self.initial_cluster_type = self.app.config.get('cluster_type', None)
@@ -460,12 +451,12 @@ class ConsoleManager(BaseConsoleManager):
                 .format(self.initial_cluster_type)
         # Add master's private IP to /etc/hosts (workers need it and
         # master's /etc/hosts is being synced to the workers)
-        # misc.add_to_etc_hosts(self.app.cloud_interface.get_private_ip(),
-        #                      [self.app.cloud_interface.get_local_hostname(),
-        #                       misc.get_hostname(),
-        #                       'master'])
+        misc.add_to_etc_hosts(self.app.cloud_interface.get_private_ip(),
+                              [self.app.cloud_interface.get_local_hostname(),
+                               misc.get_hostname(),
+                               'master'])
         # Set the default hostname
-        # misc.set_hostname(self.app.cloud_interface.get_local_hostname())
+        misc.set_hostname(self.app.cloud_interface.get_local_hostname())
         log.info("Completed the initial cluster startup process. {0}".format(
             cc_detail))
         return True
@@ -1069,6 +1060,8 @@ class ConsoleManager(BaseConsoleManager):
         # Spot requests cannot be tagged and thus there is no good way of associating those
         # back with a cluster after a reboot so cancel those
         log.debug("Initiating cluster reboot.")
+        # Place a flag on the system to indicate if this cluster has been rebooted
+        misc.run("touch {0}".format(paths.REBOOT_FLAG_FILE))
         # Don't detach volumes only on the EC2 cloud
         sd_filesystems = True
         if self.app.cloud_type == 'ec2':
